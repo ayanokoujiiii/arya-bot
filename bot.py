@@ -4,7 +4,7 @@
 Arya Bot — ربات تلگرام ایجنت‌وار با پشتیبانی چند مدل AI
 ساخته شده برای اجرا روی Deepnote
 """
-import os, json, subprocess, re, asyncio, logging
+import os, json, subprocess, re, asyncio, logging, threading, time
 import requests
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (Application, CommandHandler, CallbackQueryHandler,
@@ -35,13 +35,36 @@ PROVIDERS = {
                    "defaults": ["grok-3", "grok-3-mini"]},
 }
 
+def load_custom_providers():
+    """پروایدرهای دلخواه کاربر از bot_config.json"""
+    try:
+        with open(CONFIG_PATH, "r", encoding="utf-8") as f:
+            cfg = json.load(f)
+        custom = cfg.get("custom_providers", {})
+        for pid, info in custom.items():
+            PROVIDERS[pid] = {
+                "name": "🔧 " + info.get("name", pid),
+                "base_url": info["base_url"],
+                "defaults": info.get("defaults", []),
+                "custom": True,
+            }
+    except Exception:
+        pass
+
 SYSTEM_PROMPT = (
-    "تو «آریا» هستی، یک ایجنت هوشمند که روی یک سرور لینوکسی زندگی می‌کنی. "
+    "تو «آریا» هستی، یک ایجنت هوشمند که روی یک سرور لینوکسی (Railway) زندگی می‌کنی. "
     "با ابزارهایت می‌توانی روی سرور کار انجام بدهی: اجرای دستورات ترمینال، ساخت و ویرایش فایل، "
     "نصب پکیج، دانلود فایل و اجرای کد. "
     "همیشه فارسی و روان جواب بده مگر کاربر زبان دیگری بخواهد. "
     "وقتی کاری روی سرور انجام می‌دهی، نتیجه را خلاصه و واضح گزارش بده. "
-    "دستورات خطرناک (حذف کل سیستم، خاموش کردن سرور و...) را هرگز اجرا نکن."
+    "دستورات خطرناک (حذف کل سیستم، خاموش کردن سرور و...) را هرگز اجرا نکن. "
+    "⚡ مهم: کد منبع خودت bot.py است — اگر کاربر خواست قابلیتی به ربات اضافه یا تغییری بده، "
+    "می‌توانی bot.py را بخوانی (read_file)، ویرایش کنی (write_file) و با ابزار restart_bot خودت را "
+    "راه‌اندازی مجدد کنی تا تغییرات اعمال شوند. قبل از بازنویسی کامل، اول فایل را بخوان تا چیزی "
+    "از قابلیت‌های فعلی حذف نشود. "
+    "⚠️ محدودیت محیط: فایل‌سیستم موقت است؛ با ری‌استارت، فایل‌های موقت پاک می‌شوند ولی "
+    "bot_config.json (کلیدها و مدل فعلی) حفظ می‌شود. "
+    "برای ذخیره دائمی اطلاعات مهم از فایل bot_config.json یا ابزار add_note استفاده کن."
 )
 
 # ===================== ابزارهای ایجنت =====================
@@ -64,6 +87,16 @@ TOOLS = [
         "parameters": {"type": "object",
                        "properties": {"path": {"type": "string"}},
                        "required": ["path"]}}},
+    {"type": "function", "function": {
+        "name": "restart_bot",
+        "description": "راه‌اندازی مجدد ربات بعد از ویرایش bot.py تا تغییرات اعمال شوند. فقط وقتی استفاده کن که واقعاً bot.py را ویرایش کرده باشی.",
+        "parameters": {"type": "object", "properties": {}}}},
+    {"type": "function", "function": {
+        "name": "add_note",
+        "description": "ذخیره یک یادداشت/نکته دائمی در حافظه ربات (bot_config.json) که با ری‌استارت پاک نمی‌شود",
+        "parameters": {"type": "object",
+                       "properties": {"note": {"type": "string", "description": "متن یادداشت"}},
+                       "required": ["note"]}}},
 ]
 
 DANGEROUS_PATTERNS = [r"rm\s+-rf\s+/\s*$", r"rm\s+-rf\s+/\*", r"mkfs", r"\bshutdown\b",
@@ -104,8 +137,22 @@ def read_file_tool(path: str) -> str:
     except Exception as e:
         return f"❌ خطا در خواندن فایل: {e}"
 
+def restart_bot_tool() -> str:
+    def _restart():
+        time.sleep(2)
+        os._exit(0)  # Railway خودش پروسه را دوباره بالا می‌آورد
+    import time
+    threading.Thread(target=_restart, daemon=True).start()
+    return "🔄 ربات ۲ ثانیه دیگر ری‌استارت می‌شود. تغییرات اعمال خواهند شد."
+
+def add_note_tool(note: str) -> str:
+    CONFIG.setdefault("notes", []).append(note)
+    save_config()
+    return f"📝 یادداشت ذخیره شد (مجموع: {len(CONFIG['notes'])} یادداشت)"
+
 TOOL_FUNCS = {"run_shell_command": run_shell_command,
-              "write_file": write_file_tool, "read_file": read_file_tool}
+              "write_file": write_file_tool, "read_file": read_file_tool,
+              "restart_bot": restart_bot_tool, "add_note": add_note_tool}
 
 # ===================== کانفیگ =====================
 def load_config():
@@ -134,6 +181,8 @@ if "gemini" not in CONFIG["keys"]:
         CONFIG["active_provider"] = "gemini"
         CONFIG["active_model"] = "gemini-2.5-pro"
         save_config()
+
+load_custom_providers()
 
 history = {}      # chat_id -> list
 user_state = {}   # user_id -> {"action": ..., ...}
@@ -317,6 +366,12 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
         prov = data.split(":", 1)[1]
         await q.edit_message_text("⏳ در حال گرفتن لیست مدل‌ها...")
         models = await asyncio.to_thread(list_models, prov)
+        if not models:
+            user_state[uid] = {"action": "await_model", "provider": prov}
+            await q.edit_message_text(
+                f"✍️ این سرویس لیست مدل نمی‌ده. **نام دقیق مدل** رو بفرست\n"
+                "(مثلاً: `gpt-4o` یا هر مدلی که سرویس داره)", parse_mode="Markdown")
+            return
         kb = [[InlineKeyboardButton(m, callback_data=f"setmodel:{prov}:{m}")] for m in models]
         kb.append([InlineKeyboardButton("✍️ ورود دستی نام مدل", callback_data=f"manualmodel:{prov}")])
         kb.append([InlineKeyboardButton("🔙 برگشت", callback_data="models")])
@@ -349,9 +404,31 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
     if data == "addkey":
         kb = [[InlineKeyboardButton(PROVIDERS[p]["name"], callback_data=f"addkey:{p}")]
               for p in PROVIDERS]
+        kb.append([InlineKeyboardButton("⚙️ سرویس دلخواه (هر API سازگار با OpenAI)", callback_data="addcustom")])
         kb.append([InlineKeyboardButton("🔙 برگشت", callback_data="keys")])
         await q.edit_message_text("➕ کلید کدوم سرویس رو می‌خوای اضافه کنی؟",
                                   reply_markup=InlineKeyboardMarkup(kb))
+        return
+    if data == "addcustom":
+        user_state[uid] = {"action": "await_custom_name"}
+        await q.edit_message_text(
+            "⚙️ **افزودن سرویس دلخواه**\n\n"
+            "هر سرویسی که API سازگار با OpenAI داشته باشه کار می‌کنه\n"
+            "(مثل atria-asi، deepseek، together و...)\n\n"
+            "مرحله ۱ از ۳: یه **اسم** براش بفرست (مثلاً: `Atria`)",
+            parse_mode="Markdown")
+        return
+    if data.startswith("delcustom:"):
+        pid = data.split(":", 1)[1]
+        CONFIG.get("custom_providers", {}).pop(pid, None)
+        CONFIG["keys"].pop(pid, None)
+        PROVIDERS.pop(pid, None)
+        if CONFIG.get("active_provider") == pid:
+            CONFIG["active_provider"] = None
+            CONFIG["active_model"] = None
+        save_config()
+        await q.edit_message_text("🗑 سرویس دلخواه حذف شد.",
+                                  reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔙 برگشت", callback_data="keys")]]))
         return
     if data.startswith("addkey:"):
         prov = data.split(":", 1)[1]
@@ -365,6 +442,9 @@ async def on_button(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             return
         kb = [[InlineKeyboardButton(PROVIDERS[p]["name"], callback_data=f"delkey:{p}")]
               for p in CONFIG["keys"]]
+        for pid in CONFIG.get("custom_providers", {}):
+            kb.append([InlineKeyboardButton(f"🗑 حذف کامل {CONFIG['custom_providers'][pid]['name']}",
+                                            callback_data=f"delcustom:{pid}")])
         kb.append([InlineKeyboardButton("🔙 برگشت", callback_data="keys")])
         await q.edit_message_text("🗑 کلید کدوم سرویس حذف بشه؟", reply_markup=InlineKeyboardMarkup(kb))
         return
@@ -411,7 +491,8 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
             CONFIG["keys"][prov] = text
             if not CONFIG.get("active_provider"):
                 CONFIG["active_provider"] = prov
-                CONFIG["active_model"] = PROVIDERS[prov]["defaults"][0]
+                defaults = PROVIDERS[prov].get("defaults") or []
+                CONFIG["active_model"] = defaults[0] if defaults else None
             save_config()
             try:
                 await update.message.delete()
@@ -421,6 +502,24 @@ async def on_message(update: Update, ctx: ContextTypes.DEFAULT_TYPE):
                 f"✅ کلید {PROVIDERS[prov]['name']} ذخیره شد.\n(پیام کلیدت رو پاک کردم ✅)\n/start",
                 reply_markup=InlineKeyboardMarkup([[InlineKeyboardButton("🔀 انتخاب مدل", callback_data=f"models:{prov}")],
                                                    [InlineKeyboardButton("🔙 منو", callback_data="menu")]]))
+            return
+        if st["action"] == "await_custom_name":
+            user_state[uid] = {"action": "await_custom_url", "name": text}
+            await update.message.reply_text(
+                f"مرحله ۲ از ۳: حالا **آدرس API** سرویس «{text}» رو بفرست\n"
+                "مثلاً: `https://api.atria-asi.ai/v1`", parse_mode="Markdown")
+            return
+        if st["action"] == "await_custom_url":
+            url = text.rstrip("/")
+            pid = "custom_" + re.sub(r"[^a-z0-9]+", "_", st["name"].lower())[:20]
+            CONFIG.setdefault("custom_providers", {})[pid] = {
+                "name": st["name"], "base_url": url, "defaults": []}
+            PROVIDERS[pid] = {"name": "🔧 " + st["name"], "base_url": url,
+                              "defaults": [], "custom": True}
+            save_config()
+            user_state[uid] = {"action": "await_key", "provider": pid}
+            await update.message.reply_text(
+                f"مرحله ۳ از ۳: حالا **کلید API** رو بفرست 🔑", parse_mode="Markdown")
             return
         if st["action"] == "await_model":
             prov = st["provider"]
